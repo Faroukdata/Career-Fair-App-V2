@@ -1,0 +1,21 @@
+/* largeur & espacements */
+.main .block-container{max-width:1100px;padding-top:1.2rem;padding-bottom:0.5rem;}
+/* titre + sous-titre */
+h1.app-title{font-size:2.0rem;line-height:1.2;margin:0;}
+p.app-subtitle{color:#6b7280;margin-top:0.25rem;font-size:0.95rem;}
+/* séparateur doux */
+.hr-soft{height:1px;border:0;background:linear-gradient(90deg,transparent,#e5e7eb,transparent);margin:0.8rem 0 1rem;}
+/* boutons et checkboxes */
+.stButton>button{border-radius:10px;padding:0.55rem 0.9rem;}
+.stCheckbox label{font-weight:500;}
+/* bouton de téléchargement pleine largeur */
+div.stDownloadButton>button{width:100%;}
+/* (décommente si tu veux masquer menu/footer) */
+/* #MainMenu{visibility:hidden;} footer{visibility:hidden;} */
+
+@media (prefers-color-scheme: dark){
+  .main .block-container{ /* un peu plus de contraste en dark */
+    background: transparent;
+  }
+}
+/* fin styles.css */

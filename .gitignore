@@ -1,0 +1,25 @@
+# ---- Python / Streamlit project .gitignore ----
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment files (never commit secrets)
+.env
+.env.*
+*.env
+
+# Streamlit secrets (MUST NOT be committed)
+.streamlit/secrets.toml
+# Exclude the entire .streamlit folder except config.toml
+.streamlit/*
+!.streamlit/config.toml

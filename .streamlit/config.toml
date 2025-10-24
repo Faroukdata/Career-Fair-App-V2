@@ -1,0 +1,7 @@
+[theme]
+base="light"
+primaryColor="#2563eb"            # bleu action
+backgroundColor="#ffffff"
+secondaryBackgroundColor="#f5f7fb" # cartes / colonnes
+textColor="#0f172a"
+font="sans serif"
