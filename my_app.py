@@ -1,13 +1,3 @@
-# my_app_merge_safe.py — garde ta base qui marche + ajoute merge sûr multi-utilisateurs
-# - même UI / logique de recherche
-# - "Save now" et autosave utilisent désormais un MERGE 3-voies (base / local / remote)
-# - colonnes booléennes: OR logique si édition simultanée
-# - colonnes texte (first_name, last_name, file_name):
-#     • si un seul côté a changé → on garde la modif
-#     • si les deux ont changé → on garde "ours" (local) et on affiche un warning de conflit
-# - lecture remote pour le merge via Dropbox API (fraîche) avec fallback sur shared URL
-# - autosave buffered 2s (modifiable en BATCH_SAVE_INTERVAL_SEC)
-
 import io
 import time
 import pathlib
@@ -27,12 +17,18 @@ STATE_SHARED_CSV_URL = st.secrets.get("STATE_SHARED_CSV_URL_HIPARIS")
 STATE_DBX_PATH = st.secrets.get("STATE_DBX_PATH_HIPARIS")
 
 # Save policy
-AUTOSAVE_DEBOUNCE_SEC   = 0.35   # debounce for instant saves when filter is active
-BATCH_SAVE_INTERVAL_SEC = 2      # 2s buffer comme demandé
+AUTOSAVE_DEBOUNCE_SEC   = 0.35   # debounce des saves instantanées quand un filtre est actif
+BATCH_SAVE_INTERVAL_SEC = 2      # 2s de buffer sans filtre
+
+# Auto-refresh (poll)
+ENABLE_REMOTE_POLL     = True    # active/désactive la détection des changements distants
+HASH_CHECK_TTL_SEC     = 3       # toutes les 3s on vérifie le hash Dropbox (léger)
+REFRESH_MS             = 2500    # cadence de refresh UI (2.5s)
+
 LOGO_PATH = "images/hi-paris.png"
 
 # UI keys
-EDITOR_KEY = "grid_all"  # state key for st.data_editor
+EDITOR_KEY = "grid_all"       # state key pour st.data_editor
 GRID_FILTER_KEY = "grid_filter_key"
 # ==============================================
 
@@ -53,7 +49,7 @@ with lc:
 with rc:
     st.markdown(
         "<h1 class='app-title' style='margin:0'>HI! PARIS Career Fair</h1>"
-        "<p class='app-subtitle'>Search • Direct CV links • Autosave (2s) avec merge sûr</p>"
+        "<p class='app-subtitle'>Search • Direct CV links • Autosave (2s) avec merge sûr • Auto-refresh</p>"
         "<hr class='hr-soft'/>",
         unsafe_allow_html=True,
     )
@@ -195,6 +191,21 @@ def _upload_with_auto_refresh(data: bytes, path: str) -> tuple[bool, str | None]
     except Exception as e:
         return (False, f"Write error: {e}")
 
+# -------- Remote hash (léger) pour auto-refresh --------
+@st.cache_data(show_spinner=False, ttl=1)
+def _get_remote_hash() -> str | None:
+    """Retourne content_hash du fichier côté Dropbox (sans télécharger le CSV)."""
+    if DBX is None:
+        return None
+    try:
+        md = DBX.files_get_metadata(STATE_DBX_PATH)
+        # md peut être FileMetadata avec .content_hash
+        if hasattr(md, "content_hash"):
+            return md.content_hash
+    except Exception:
+        return None
+    return None
+
 # ---------------- Keys & snapshots ----------------
 
 def _key(df_like: pd.DataFrame) -> pd.Series:
@@ -224,7 +235,7 @@ def _three_way_merge(base: pd.DataFrame, ours: pd.DataFrame, theirs: pd.DataFram
     out = T[[*TEXT_COLS, *BOOL_COLS]].copy()  # base "theirs"
     conflicts = []
 
-    # TEXT COLS: ours vs theirs vs base (keep added/removed rows as well)
+    # TEXT COLS
     for c in TEXT_COLS:
         b = B[c].astype("string") if c in B else pd.Series(index=all_idx, dtype="string")
         o = O[c].astype("string") if c in O else pd.Series(index=all_idx, dtype="string")
@@ -237,13 +248,13 @@ def _three_way_merge(base: pd.DataFrame, ours: pd.DataFrame, theirs: pd.DataFram
         col = out[c].astype("string")
         col[only_o] = o[only_o]
         col[only_t] = t[only_t]
-        # double edit → keep ours, note conflict
         if both.any():
             conflicts.extend([f"{c}@{idx}" for idx in both[both].index.tolist()])
-            col[both] = o[both]
-        out[c] = col.fillna("")
+            col[both] = o[both]  # ours wins
+        col = col.fillna("")
+        out[c] = col
 
-    # BOOL COLS: OR logic on both edits, else take the side that changed
+    # BOOL COLS: OR si double modif
     for c in BOOL_COLS:
         b = B[c].astype("boolean") if c in B else pd.Series(index=all_idx, dtype="boolean")
         o = O[c].astype("boolean") if c in O else pd.Series(index=all_idx, dtype="boolean")
@@ -350,7 +361,6 @@ def _flush_to_disk(ok_text: str, err_text: str) -> None:
         try:
             remote_df = _download_current_df_from_dbx()
         except Exception:
-            # fallback lecture via URL si API KO
             remote_df = fetch_state_df()
 
         base_df = st.session_state.get("base_df")
@@ -398,6 +408,10 @@ st.session_state.setdefault("last_batch_write", time.time())
 st.session_state.setdefault("last_save_ts", 0.0)
 st.session_state.setdefault("q", "")
 st.session_state.setdefault("prev_q", "")
+
+# Auto-refresh state
+st.session_state.setdefault("last_seen_hash", None)
+st.session_state.setdefault("last_hash_check", 0.0)
 
 # ---------------- Search controls ----------------
 cc, ic = st.columns([1, 4])
@@ -475,12 +489,11 @@ delta_df = _build_delta_from_editor(st.session_state.grid_df, edited_rows)
 now = time.time()
 
 if not delta_df.empty:
-    # Optimistic update on the full DF (source of truth),
-    # but DO NOT rebuild grid_df in this rerun (avoids click flicker)
+    # Optimistic update sur la source de vérité
     st.session_state.df = _apply_optimistic(st.session_state.df, delta_df)
 
     if filter_active:
-        # Immediate autosave (debounced)
+        # Save instant (debounced)
         if (now - st.session_state.last_save_ts) >= AUTOSAVE_DEBOUNCE_SEC:
             _flush_to_disk("Saved change(s) ✅", "Auto-save failed")
             st.session_state.last_save_ts = now
@@ -490,11 +503,53 @@ if not delta_df.empty:
         secs = max(0, int(BATCH_SAVE_INTERVAL_SEC - (now - st.session_state.last_batch_write)))
         st.info(f"Pending changes buffered. Auto-saving in ~{secs}s (or when you start filtering).")
 
-# Traitement du bouton Save now (haut de page)
+# Traitement du bouton Save now
 if st.session_state.pop("_want_save", False):
     _flush_to_disk("Saved ✅", "Save failed")
 
-# Periodic auto-flush for buffered mode (no filter)
+# Periodic auto-flush pour le mode buffer (pas de filtre)
 if (not filter_active) and st.session_state.buffer_dirty:
     if (now - st.session_state.last_batch_write) >= BATCH_SAVE_INTERVAL_SEC:
         _flush_to_disk("Buffered changes auto-saved ✅", "Auto-save failed")
+
+# ---------------- Auto-refresh (poll hash) ----------------
+if ENABLE_REMOTE_POLL:
+    # 1) Vérifie périodiquement le hash Dropbox (léger, pas de download)
+    should_check = (now - st.session_state["last_hash_check"]) >= HASH_CHECK_TTL_SEC
+    if should_check:
+        rhash = _get_remote_hash()
+        st.session_state["last_hash_check"] = now
+        if rhash and st.session_state["last_seen_hash"] is None:
+            st.session_state["last_seen_hash"] = rhash
+        elif rhash and rhash != st.session_state["last_seen_hash"]:
+            # Un autre utilisateur a modifié le fichier → merge 3-voies
+            try:
+                remote_df = _download_current_df_from_dbx()
+            except Exception:
+                remote_df = fetch_state_df()
+
+            base_df = st.session_state.get("base_df", remote_df.copy())
+            ours_df = st.session_state.df
+
+            merged, conflicts = _three_way_merge(base_df, ours_df, remote_df)
+            st.session_state.df = merged
+            _snapshot_base()
+            st.session_state["last_seen_hash"] = rhash
+
+            # Rebuild grid sans changer le filtre
+            base_df_for_view = st.session_state.df
+            view_df, current_filter_key = _compute_view_and_key(base_df_for_view, st.session_state.q)
+            _reset_grid(view_df, current_filter_key)
+
+            msg = "Données mises à jour depuis Dropbox 🔄 (merge appliqué)"
+            if conflicts:
+                msg += f" • {len(conflicts)} conflit(s) résolu(s)"
+            st.toast(msg)
+
+    # 2) Déclenche l’auto-refresh UI toutes REFRESH_MS ms (API stable)
+    try:
+        st.autorefresh(interval=REFRESH_MS, key="__poll_remote__")
+    except Exception:
+        # Compat anciennes versions de Streamlit
+        if hasattr(st, "experimental_autorefresh"):
+            st.experimental_autorefresh(interval=REFRESH_MS, key="__poll_remote__")
