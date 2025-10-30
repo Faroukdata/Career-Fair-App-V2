@@ -16,10 +16,6 @@ STATE_SHARED_CSV_URL = st.secrets.get("STATE_SHARED_CSV_URL_HIPARIS")
 # Write (API): path inside your Dropbox App Folder
 STATE_DBX_PATH = st.secrets.get("STATE_DBX_PATH_HIPARIS")
 
-# Save policy
-AUTOSAVE_DEBOUNCE_SEC   = 0.35   # debounce des saves instantanées quand un filtre est actif
-BATCH_SAVE_INTERVAL_SEC = 2      # 2s de buffer sans filtre
-
 # Auto-refresh (poll)
 ENABLE_REMOTE_POLL     = True    # active/désactive la détection des changements distants
 HASH_CHECK_TTL_SEC     = 3       # toutes les 3s on vérifie le hash Dropbox (léger)
@@ -402,12 +398,10 @@ if "df" not in st.session_state:
         st.error(f"Failed to load CSV from shared link: {e}")
         st.stop()
 
-# Save/buffer controls defaults
-st.session_state.setdefault("buffer_dirty", False)
-st.session_state.setdefault("last_batch_write", time.time())
-st.session_state.setdefault("last_save_ts", 0.0)
+# Defaults (sans logique buffer)
 st.session_state.setdefault("q", "")
 st.session_state.setdefault("prev_q", "")
+st.session_state.setdefault("last_auto_save", 0.0)
 
 # Auto-refresh state
 st.session_state.setdefault("last_seen_hash", None)
@@ -417,8 +411,6 @@ st.session_state.setdefault("last_hash_check", 0.0)
 cc, ic = st.columns([1, 4])
 with cc:
     if st.button("Clear search", use_container_width=True):
-        if st.session_state.buffer_dirty:
-            _flush_to_disk("Saved pending changes ✅", "Save failed")
         st.session_state.q = ""
         st.session_state.prev_q = ""
         st.session_state.pop("grid_df", None)
@@ -435,11 +427,7 @@ with ic:
 
 filter_active = bool(st.session_state.q.strip())
 
-# ---- Flush when toggling filter state (both directions) ----
-# A) no filter -> filter ON : flush buffered edits first
-if (not st.session_state.prev_q.strip()) and filter_active and st.session_state.buffer_dirty:
-    _flush_to_disk("Saved pending changes before applying filter ✅", "Save failed")
-
+# ---- Flush when toggling filter state (keep only B) ----
 # B) filter -> no filter : matérialiser les deltas en mémoire du widget puis flush
 if st.session_state.prev_q.strip() and (not filter_active):
     ed_state_pre = st.session_state.get(EDITOR_KEY, {})
@@ -485,32 +473,19 @@ edited_rows = ed_state.get("edited_rows", {})  # {row_idx: {col: new_val, ...}}
 
 delta_df = _build_delta_from_editor(st.session_state.grid_df, edited_rows)
 
-# ---------------- Save policy ----------------
+# ---------------- Apply edits (optimistic), no buffer/debounce ----------------
 now = time.time()
-
 if not delta_df.empty:
-    # Optimistic update sur la source de vérité
     st.session_state.df = _apply_optimistic(st.session_state.df, delta_df)
-
-    if filter_active:
-        # Save instant (debounced)
-        if (now - st.session_state.last_save_ts) >= AUTOSAVE_DEBOUNCE_SEC:
-            _flush_to_disk("Saved change(s) ✅", "Auto-save failed")
-            st.session_state.last_save_ts = now
-    else:
-        # No filter → buffer only (no immediate write)
-        st.session_state.buffer_dirty = True
-        secs = max(0, int(BATCH_SAVE_INTERVAL_SEC - (now - st.session_state.last_batch_write)))
-        st.info(f"Pending changes buffered. Auto-saving in ~{secs}s (or when you start filtering).")
 
 # Traitement du bouton Save now
 if st.session_state.pop("_want_save", False):
     _flush_to_disk("Saved ✅", "Save failed")
 
-# Periodic auto-flush pour le mode buffer (pas de filtre)
-if (not filter_active) and st.session_state.buffer_dirty:
-    if (now - st.session_state.last_batch_write) >= BATCH_SAVE_INTERVAL_SEC:
-        _flush_to_disk("Buffered changes auto-saved ✅", "Auto-save failed")
+# ---------------- Auto-save périodique (toutes les 5s) ----------------
+if (now - st.session_state["last_auto_save"]) >= 5:
+    _flush_to_disk("Saved ✅", "Auto-save failed")
+    st.session_state["last_auto_save"] = now
 
 # ---------------- Auto-refresh (poll hash) ----------------
 if ENABLE_REMOTE_POLL:
